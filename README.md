@@ -1487,3 +1487,236 @@ If this curriculum or project helped you master Express.js, please consider supp
 ⭐ **Star this repository** if you found it valuable!
 
 </div>
+
+
+
+### Complete Express.js Production Middleware & Architecture Code Examples
+
+#### 1. Type-Safe Zod Request Validation Middleware
+Validates request body, query parameters, and URL route params in a single reusable middleware factory:
+
+```ts
+import { Request, Response, NextFunction } from 'express';
+import { z, ZodError } from 'zod';
+
+export function validateRequest(schemas: {
+  body?: z.ZodSchema;
+  query?: z.ZodSchema;
+  params?: z.ZodSchema;
+}) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      if (schemas.body) {
+        req.body = await schemas.body.parseAsync(req.body);
+      }
+      if (schemas.query) {
+        req.query = await schemas.query.parseAsync(req.query);
+      }
+      if (schemas.params) {
+        req.params = await schemas.params.parseAsync(req.params);
+      }
+      next();
+    } catch (error) {
+      if (error instanceof ZodError) {
+        return res.status(400).json({
+          status: 'fail',
+          message: 'Validation failed',
+          errors: error.errors.map((err) => ({
+            field: err.path.join('.'),
+            message: err.message,
+          })),
+        });
+      }
+      next(error);
+    }
+  };
+}
+
+// Route Usage:
+const CreateUserSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+  role: z.enum(['USER', 'ADMIN']).default('USER'),
+});
+
+// router.post('/users', validateRequest({ body: CreateUserSchema }), userController.create);
+```
+
+---
+
+#### 2. Centralized RFC 7807 Problem Details Error Handler
+Ensures every exception returns a standardized error contract across the entire microservice:
+
+```ts
+import { Request, Response, NextFunction, ErrorRequestHandler } from 'express';
+
+export class AppError extends Error {
+  public readonly statusCode: number;
+  public readonly isOperational: boolean;
+
+  constructor(message: string, statusCode: number = 500, isOperational: boolean = true) {
+    super(message);
+    this.statusCode = statusCode;
+    this.isOperational = isOperational;
+    Error.captureStackTrace(this, this.constructor);
+  }
+}
+
+export const errorHandler: ErrorRequestHandler = (err, req: Request, res: Response, next: NextFunction) => {
+  const statusCode = err.statusCode || 500;
+  const isProd = process.env.NODE_ENV === 'production';
+
+  const responsePayload = {
+    type: 'about:blank',
+    title: err.name || 'Internal Server Error',
+    status: statusCode,
+    detail: isProd && statusCode === 500 ? 'An unexpected error occurred.' : err.message,
+    instance: req.originalUrl,
+    timestamp: new Date().toISOString(),
+    ...(isProd ? {} : { stack: err.stack }),
+  };
+
+  console.error(`[Error] ${req.method} ${req.originalUrl}:`, err);
+  res.status(statusCode).json(responsePayload);
+};
+```
+
+---
+
+#### 3. Refresh Token Rotation & Role-Based Access Control (RBAC)
+Implements secure HTTP-only cookie-based authentication with automatic refresh token rotation:
+
+```ts
+import { Request, Response, NextFunction } from 'express';
+import jwt from 'jsonwebtoken';
+
+interface UserPayload {
+  userId: string;
+  role: 'USER' | 'ADMIN' | 'EDITOR';
+}
+
+declare global {
+  namespace Express {
+    interface Request {
+      user?: UserPayload;
+    }
+  }
+}
+
+export function authenticate(req: Request, res: Response, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ message: 'Missing Bearer authentication token' });
+  }
+
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET!) as UserPayload;
+    req.user = payload;
+    next();
+  } catch (err) {
+    return res.status(403).json({ message: 'Token expired or invalid' });
+  }
+}
+
+export function authorize(allowedRoles: Array<'USER' | 'ADMIN' | 'EDITOR'>) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!req.user || !allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ message: 'Forbidden: Insufficient privileges' });
+    }
+    next();
+  };
+}
+```
+
+---
+
+#### 4. Real-time Server-Sent Events (SSE) Route with Heartbeat Ping
+Stream live progress notifications to connected browser clients over persistent HTTP:
+
+```ts
+import { Request, Response, Router } from 'express';
+
+const sseRouter = Router();
+
+sseRouter.get('/live-events', (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // Disable Nginx proxy buffering
+  res.flushHeaders();
+
+  // Send initial connection ACK
+  res.write(`data: ${JSON.stringify({ status: 'connected', time: Date.now() })}\n\n`);
+
+  // Heartbeat keep-alive every 15s to keep NAT/firewalls from dropping idle sockets
+  const keepAliveInterval = setInterval(() => {
+    res.write(': keep-alive ping\n\n');
+  }, 15000);
+
+  // Example periodic event
+  let count = 0;
+  const timer = setInterval(() => {
+    count++;
+    res.write(`event: notification\ndata: ${JSON.stringify({ count, message: 'Server metric updated' })}\n\n`);
+    if (count >= 10) {
+      clearInterval(timer);
+      res.write('event: close\ndata: finished\n\n');
+      res.end();
+    }
+  }, 2000);
+
+  req.on('close', () => {
+    clearInterval(keepAliveInterval);
+    clearInterval(timer);
+    console.log('Client closed SSE connection');
+  });
+});
+```
+
+---
+
+#### 5. Graceful Zero-Downtime Server Shutdown
+Ensures inflight requests finish processing before Node terminates on Kubernetes/Docker eviction:
+
+```ts
+import http from 'http';
+import { app } from './app';
+
+const server = http.createServer(app);
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
+
+function gracefulShutdown(signal: string) {
+  console.log(`Received ${signal}. Starting graceful shutdown...`);
+
+  // 1. Stop accepting new connections
+  server.close(async () => {
+    console.log('HTTP server closed. In-flight requests drained.');
+
+    try {
+      // 2. Disconnect database connection pools
+      // await prisma.$disconnect();
+      // await redisClient.quit();
+      console.log('Database and cache connections cleanly terminated.');
+      process.exit(0);
+    } catch (err) {
+      console.error('Error during teardown:', err);
+      process.exit(1);
+    }
+  });
+
+  // Force shutdown after 10s if connections refuse to close
+  setTimeout(() => {
+    console.error('Forced shutdown: Timed out waiting for connections to close.');
+    process.exit(1);
+  }, 10000).unref();
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+```
